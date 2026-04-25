@@ -15,9 +15,10 @@ class MotionTracker:
     def __init__(self):
         self.picam = Picamera2()
         video_config = self.picam.create_video_configuration(
-            main={"size": (config.FRAME_WIDTH, config.FRAME_HEIGHT),
-                  "format": "RGB888"}
-        )
+    		main={"size": (config.FRAME_WIDTH, config.FRAME_HEIGHT),
+          		"format": "RGB888"},
+    		sensor={"output_size": (1640, 1232), "bit_depth": 8}
+	)
         self.picam.configure(video_config)
         self.picam.start()
 
