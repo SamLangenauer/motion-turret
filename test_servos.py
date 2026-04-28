@@ -31,13 +31,13 @@ def main():
         elif k == "c":
             t.center()
         elif k == "\x1b[A":  # up
-            t.nudge(0, -STEP)
-        elif k == "\x1b[B":  # down
             t.nudge(0, STEP)
+        elif k == "\x1b[B":  # down
+            t.nudge(0, -STEP)
         elif k == "\x1b[C":  # right
-            t.nudge(STEP, 0)
-        elif k == "\x1b[D":  # left
             t.nudge(-STEP, 0)
+        elif k == "\x1b[D":  # left
+            t.nudge(STEP, 0)
         pan, tilt = t.position
         print(f"pan={pan:5.1f}  tilt={tilt:5.1f}   ", end="\r")
     print()
