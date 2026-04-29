@@ -13,7 +13,7 @@ PAN_CENTER = 90
 
 TILT_MIN_ANGLE = 58     # don't let tilt crash into the base
 TILT_MAX_ANGLE = 177
-TILT_CENTER = 90
+TILT_CENTER = 115
 
 # PCA9685 pulse width range in microseconds.
 # 500-2500 is the standard range for 9g-class hobby servos.
@@ -32,7 +32,7 @@ MIN_CONTOUR_AREA = 1000      # ignore blobs smaller than this (pixels)
 # Aim-point vertical bias: 0.5 = bbox center, >0.5 = aim lower (toward feet),
 # <0.5 = aim higher (toward head). 0.6 approximates human center-of-mass when
 # the motion blob captures the full silhouette.
-AIM_VERTICAL_BIAS = 0.6
+AIM_VERTICAL_BIAS = 0.45
 
 # --- Tracking control (Phase 4) ---
 KP_PAN = 0.04              # proportional gain, pan axis
@@ -51,4 +51,4 @@ RECENTER_STEP_DEG = 1.5             # how aggressively to slew home (deg/frame)
 # Slew rate limit: maximum servo correction per control cycle (degrees).
 # Caps how aggressively the controller can chase a target. Smaller = smoother
 # tracking, slower acquisition; larger = snappier, more overshoot risk.
-MAX_NUDGE_DEG = 10
+MAX_NUDGE_DEG = 20
