@@ -78,7 +78,7 @@ class MotionTracker:
 
         self._smooth_cx = None
         self._smooth_cy = None
-        self._smooth_alpha = 0.6
+        self._smooth_alpha = 0.45
 
         self._last_sensor_ts_ns = 0
 
@@ -107,7 +107,7 @@ class MotionTracker:
         if timer is not None:
             timer.lap("capture")
             timer.mark("preproc")
-        gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         gray = cv2.GaussianBlur(gray, (11, 11), 0)
         if timer is not None: timer.lap("preproc")
         return frame, gray
@@ -237,25 +237,43 @@ class MotionTracker:
                 self._candidate_box = None
                 return frame, None, np.zeros_like(gray)
 
-            # Build the tracker (MOSSE preferred, KCF fallback)
+            # Build the tracker
             if timer is not None: timer.mark("kcf_init")
             self._csrt = _make_tracker()
 
             # Expand the motion bbox into a torso-biased aim box.
             x, y, w, h = bbox
             fh = frame.shape[0]
-            new_h = int(h * 3.5)
-            new_y = max(0, y - int(h * 0.5))
+            new_h = int(h * 2.0)
+            new_y = max(0, y - int(h * 0.2))
             new_h = min(new_h, fh - new_y)
-            new_x = max(0, x - int(w * 0.3))
-            new_w = int(w * 1.6)
+            new_w = int(w * 1.2)
+            new_x = max(0, x - int(w * 0.1))
             new_w = min(new_w, frame.shape[1] - new_x)
+            
+            # --- BEGIN CPU SAFETY CLAMP ---
+            # If the box is massive, shrink the tracking area to the core center 
+            # to prevent the Pi from choking on the initialization math.
+            MAX_DIM = 250
+            if new_w > MAX_DIM or new_h > MAX_DIM:
+                # Find the center of the expanded box
+                cx = new_x + (new_w // 2)
+                cy = new_y + (new_h // 2)
+                # Clamp dimensions
+                new_w = min(new_w, MAX_DIM)
+                new_h = min(new_h, MAX_DIM)
+                # Re-center the smaller box
+                new_x = cx - (new_w // 2)
+                new_y = cy - (new_h // 2)
+            # --- END CPU SAFETY CLAMP ---
+
             bbox = (new_x, new_y, new_w, new_h)
             self._last_bbox = bbox
 
-            # Initialize on grayscale (faster than RGB; both KCF and MOSSE
-            # accept single-channel input).
+            # Initialize on FULL resolution, but with a safely sized box
             self._csrt.init(gray, bbox)
+
+            # Initialize on FULL resolution
             if timer is not None: timer.lap("kcf_init")
 
             self._state = self.STATE_TRACKING
@@ -271,11 +289,21 @@ class MotionTracker:
 
         if self._state == self.STATE_TRACKING:
             if timer is not None: timer.mark("kcf_update")
+            
+            # Update on FULL resolution
             ok, bbox = self._csrt.update(gray)
             if timer is not None: timer.lap("kcf_update")
 
-            x, y, w, h = bbox
             fh, fw = frame.shape[:2]
+            
+            # We must explicitly convert the tuple floats back to ints to prevent type errors
+            if ok:
+                x, y, w, h = [int(v) for v in bbox]
+                bbox = (x, y, w, h)
+            else:
+                x, y, w, h = 0, 0, 0, 0
+                bbox = (0, 0, 0, 0)
+                
             bbox_invalid = (
                 w < 20 or h < 20 or
                 w > fw * 0.9 or h > fh * 0.9 or

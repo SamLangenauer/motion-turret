@@ -41,7 +41,7 @@ class Tracker:
         self._stream_jpg = None
         self._stream_lock = threading.Lock()
         self._stream_frame_counter = 0
-        self._STREAM_EVERY_N = 1
+        self._STREAM_EVERY_N = 3
         self._STREAM_QUALITY = 40
 
         # Latency instrumentation. Pass latency_csv=None to disable.
@@ -161,8 +161,7 @@ class Tracker:
             return
         if self._last_frame is None:
             return
-
-        bgr = _cv2.cvtColor(self._last_frame, _cv2.COLOR_RGB2BGR)
+        bgr = self._last_frame.copy()
         h, w = bgr.shape[:2]
         cx0, cy0 = w // 2, h // 2
 

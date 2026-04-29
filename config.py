@@ -35,8 +35,8 @@ MIN_CONTOUR_AREA = 750      # ignore blobs smaller than this (pixels)
 AIM_VERTICAL_BIAS = 0.45
 
 # --- Tracking control (Phase 4) ---
-KP_PAN = 0.05              # proportional gain, pan axis
-KP_TILT = 0.05             # proportional gain, tilt axis
+KP_PAN = 0.035             # proportional gain, pan axis
+KP_TILT = 0.035            # proportional gain, tilt axis
 DEADZONE_PIXELS = 35       # don't correct if target is within N px of center
 
 # --- TF-Luna (Phase 5) ---
@@ -51,4 +51,4 @@ RECENTER_STEP_DEG = 1.5             # how aggressively to slew home (deg/frame)
 # Slew rate limit: maximum servo correction per control cycle (degrees).
 # Caps how aggressively the controller can chase a target. Smaller = smoother
 # tracking, slower acquisition; larger = snappier, more overshoot risk.
-MAX_NUDGE_DEG = 40
+MAX_NUDGE_DEG = 5

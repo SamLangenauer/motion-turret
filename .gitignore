@@ -23,3 +23,5 @@ Thumbs.db
 captures/       # if you later save camera frames for debug
 *.mp4
 *.avi
+latency.csv
+__pycache__/
