@@ -47,10 +47,12 @@ class MotionTracker:
 
     def __init__(self, mode="mog2"):
         self.picam = Picamera2()
+        cam_controls = {"FrameRate": 80}
         video_config = self.picam.create_video_configuration(
             main={"size": (config.FRAME_WIDTH, config.FRAME_HEIGHT),
-                  "format": "RGB888"},
-            sensor={"output_size": (1640, 1232), "bit_depth": 8}
+                  "format": "BGR888"},
+            sensor={"output_size": (1640, 1232), "bit_depth": 8},
+            controls=cam_controls
         )
         self.picam.configure(video_config)
         self.picam.start()
