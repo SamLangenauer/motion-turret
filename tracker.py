@@ -1,18 +1,27 @@
 # tracker.py — closed-loop P-controller driving the turret to follow a tracked target.
+#
+# Phase 4.5+ instrumentation:
+#   - StageTimer logs per-frame stage durations to latency.csv and prints
+#     periodic p50/p95/p99/max summaries.
+#   - Stream encoding can be toggled at startup via the STREAM env var
+#     (STREAM=0 disables the MJPEG server and skips encoding entirely).
+#   - DURATION env var caps the run length in seconds (useful for benchmarks).
 
 import threading
 import http.server
 import socketserver
 import time
+import os
 import cv2 as _cv2
 
 import config
 from servos import Turret
 from vision import MotionTracker
+from instrument import StageTimer
 
 
 class Tracker:
-    def __init__(self):
+    def __init__(self, enable_stream=True, latency_csv="latency.csv"):
         self.turret = Turret()
         self.vision = MotionTracker(mode="tracker")
 
@@ -27,59 +36,102 @@ class Tracker:
         self._last_frame = None
         self._last_target = None
 
-        # Stream encoding state — produced by main loop, consumed by HTTP handler
+        # Stream encoding state
+        self._enable_stream = enable_stream
         self._stream_jpg = None
         self._stream_lock = threading.Lock()
         self._stream_frame_counter = 0
-        self._STREAM_EVERY_N = 3        # encode 1 of every N frames
-        self._STREAM_QUALITY = 20
+        self._STREAM_EVERY_N = 1
+        self._STREAM_QUALITY = 40
+
+        # Latency instrumentation. Pass latency_csv=None to disable.
+        self.timer = StageTimer(latency_csv, summary_every=60) if latency_csv else None
 
     # ---- main control loop ----
 
     def step(self):
+        if self.timer is not None:
+            self.timer.frame_begin()
+
+        # Warmup: run capture so the camera/AGC settles, but don't drive servos.
         if self._warmup_frames > 0:
-            self.vision.detect()
+            self.vision.detect(timer=self.timer)
             self._warmup_frames -= 1
+            if self.timer is not None:
+                self.timer.note("phase", "warmup")
+                self.timer.note("state", self.vision.state)
+                self.timer.note("sensor_age_ms", f"{self.vision.sensor_age_ms():.2f}")
+                self.timer.frame_end()
             return None
 
+        # Settle: a servo command was just issued; wait for the gimbal to stop
+        # so framediff/KCF aren't seeing pure ego-motion.
         if self._settle > 0:
-            self.vision.detect()
+            self.vision.detect(timer=self.timer)
             self._settle -= 1
+            if self.timer is not None:
+                self.timer.note("phase", "settle")
+                self.timer.note("settle_remaining", self._settle)
+                self.timer.note("state", self.vision.state)
+                self.timer.note("sensor_age_ms", f"{self.vision.sensor_age_ms():.2f}")
+                self.timer.frame_end()
             return None
 
-        frame, target, _ = self.vision.detect()
+        # Active perception+control.
+        frame, target, _ = self.vision.detect(timer=self.timer)
         self._last_frame = frame
         self._last_target = target
 
-        # Maintain stream encoding (cheap if no clients connected,
-        # because no one will read self._stream_jpg)
-        self._maybe_encode_stream_frame()
+        if self._enable_stream:
+            if self.timer is not None: self.timer.mark("stream")
+            self._maybe_encode_stream_frame()
+            if self.timer is not None: self.timer.lap("stream")
+
+        result = None
+        commanded = False
 
         if not self.vision.is_tracking or target is None:
             self._lost_frames += 1
             if self._lost_frames > config.LOST_LOCK_FRAMES_TO_RECENTER:
+                if self.timer is not None: self.timer.mark("control")
                 self._recenter_step()
-            return None
+                if self.timer is not None: self.timer.lap("control")
+                commanded = True
+        else:
+            self._lost_frames = 0
+            cx, cy, _area = target
+            err_x = cx - self._frame_cx
+            err_y = cy - self._frame_cy
 
-        self._lost_frames = 0
+            if abs(err_x) >= config.DEADZONE_PIXELS or \
+               abs(err_y) >= config.DEADZONE_PIXELS:
+                dpan  =  config.KP_PAN  * err_x
+                dtilt = -config.KP_TILT * err_y
+                dpan  = max(-config.MAX_NUDGE_DEG, min(config.MAX_NUDGE_DEG, dpan))
+                dtilt = max(-config.MAX_NUDGE_DEG, min(config.MAX_NUDGE_DEG, dtilt))
 
-        cx, cy, _area = target
-        err_x = cx - self._frame_cx
-        err_y = cy - self._frame_cy
+                if self.timer is not None: self.timer.mark("control")
+                self.turret.nudge(dpan, dtilt)
+                if self.timer is not None: self.timer.lap("control")
+                commanded = True
 
-        if abs(err_x) < config.DEADZONE_PIXELS and \
-           abs(err_y) < config.DEADZONE_PIXELS:
-            return target
+                max_step = max(abs(dpan), abs(dtilt))
+                self._settle = max(self._SETTLE_FRAMES, int(round(max_step / 3.0)))
 
-        dpan  =  config.KP_PAN  * err_x
-        dtilt = -config.KP_TILT * err_y
-        dpan  = max(-config.MAX_NUDGE_DEG, min(config.MAX_NUDGE_DEG, dpan))
-        dtilt = max(-config.MAX_NUDGE_DEG, min(config.MAX_NUDGE_DEG, dtilt))
+                if self.timer is not None:
+                    self.timer.note("dpan", f"{dpan:.2f}")
+                    self.timer.note("dtilt", f"{dtilt:.2f}")
+                    self.timer.note("settle_set", self._settle)
+            result = target
 
-        self.turret.nudge(dpan, dtilt)
-        max_step = max(abs(dpan), abs(dtilt))
-        self._settle = max(self._SETTLE_FRAMES, int(round(max_step / 3.0)))
-        return target
+        if self.timer is not None:
+            self.timer.note("phase", "active")
+            self.timer.note("state", self.vision.state)
+            self.timer.note("commanded", "1" if commanded else "0")
+            self.timer.note("sensor_age_ms", f"{self.vision.sensor_age_ms():.2f}")
+            self.timer.frame_end()
+
+        return result
 
     def _recenter_step(self):
         pan, tilt = self.turret.position
@@ -101,7 +153,7 @@ class Tracker:
             self.turret.nudge(dpan, dtilt)
             self._settle = self._SETTLE_FRAMES
 
-    # ---- stream frame encoder (runs in main thread) ----
+    # ---- stream frame encoder (runs inline in main thread) ----
 
     def _maybe_encode_stream_frame(self):
         self._stream_frame_counter += 1
@@ -156,7 +208,7 @@ class Tracker:
                     with tracker_self._stream_lock:
                         jpg = tracker_self._stream_jpg
                     if jpg is None or jpg is last_sent:
-                        time.sleep(0.05)
+                        time.sleep(0.025)
                         continue
                     last_sent = jpg
                     try:
@@ -192,11 +244,24 @@ class Tracker:
             self.close()
 
     def close(self):
+        if self.timer is not None:
+            self.timer.close()
         self.vision.close()
         self.turret.center()
 
 
 if __name__ == "__main__":
-    t = Tracker()
-    t.start_mjpeg_server(8080)
-    t.run()
+    # Stream toggle:
+    #   STREAM=1 (default) — start MJPEG server, encode frames inline
+    #   STREAM=0           — disable streaming entirely (no encode, no server)
+    enable_stream = os.environ.get("STREAM", "1") != "0"
+
+    # Optional run-length cap for benchmarks:
+    #   DURATION=60 python tracker.py    runs for 60 s then exits cleanly
+    duration = os.environ.get("DURATION")
+    duration = float(duration) if duration else None
+
+    t = Tracker(enable_stream=enable_stream)
+    if enable_stream:
+        t.start_mjpeg_server(8080)
+    t.run(duration_sec=duration)

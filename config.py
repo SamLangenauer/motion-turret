@@ -1,4 +1,4 @@
-# config.py — tuning constants and hardware assignments
+#http://100.70.102.124:8080/# config.py — tuning constants and hardware assignments
 
 # --- Servo channels on PCA9685 ---
 PAN_CHANNEL = 0
@@ -13,7 +13,7 @@ PAN_CENTER = 90
 
 TILT_MIN_ANGLE = 58     # don't let tilt crash into the base
 TILT_MAX_ANGLE = 177
-TILT_CENTER = 115
+TILT_CENTER = 130
 
 # PCA9685 pulse width range in microseconds.
 # 500-2500 is the standard range for 9g-class hobby servos.
@@ -21,13 +21,13 @@ SERVO_MIN_PULSE = 500
 SERVO_MAX_PULSE = 2500
 
 # --- Camera ---
-FRAME_WIDTH = 640
+FRAME_WIDTH = 680
 FRAME_HEIGHT = 480
 FRAME_RATE = 30
 
 # --- Motion detection ---
 MOTION_THRESHOLD = 25       # pixel-difference threshold (0-255)
-MIN_CONTOUR_AREA = 1000      # ignore blobs smaller than this (pixels)
+MIN_CONTOUR_AREA = 750      # ignore blobs smaller than this (pixels)
 
 # Aim-point vertical bias: 0.5 = bbox center, >0.5 = aim lower (toward feet),
 # <0.5 = aim higher (toward head). 0.6 approximates human center-of-mass when
@@ -35,8 +35,8 @@ MIN_CONTOUR_AREA = 1000      # ignore blobs smaller than this (pixels)
 AIM_VERTICAL_BIAS = 0.45
 
 # --- Tracking control (Phase 4) ---
-KP_PAN = 0.04              # proportional gain, pan axis
-KP_TILT = 0.04             # proportional gain, tilt axis
+KP_PAN = 0.05              # proportional gain, pan axis
+KP_TILT = 0.05             # proportional gain, tilt axis
 DEADZONE_PIXELS = 35       # don't correct if target is within N px of center
 
 # --- TF-Luna (Phase 5) ---
@@ -51,4 +51,4 @@ RECENTER_STEP_DEG = 1.5             # how aggressively to slew home (deg/frame)
 # Slew rate limit: maximum servo correction per control cycle (degrees).
 # Caps how aggressively the controller can chase a target. Smaller = smoother
 # tracking, slower acquisition; larger = snappier, more overshoot risk.
-MAX_NUDGE_DEG = 20
+MAX_NUDGE_DEG = 40

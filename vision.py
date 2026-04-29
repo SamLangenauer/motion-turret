@@ -1,20 +1,45 @@
-# vision.py — camera capture + two-stage acquisition / tracking
+# vision.py — camera capture + two-stage acquisition / tracking.
 #
 # Modes:
-#   "mog2"      — static-camera background subtractor. Best for test_vision.py
-#                 on a fixed mount.
+#   "mog2"      — static-camera background subtractor.
 #   "framediff" — frame differencing. Legacy mode, kept for diagnostics.
-#   "tracker"   — two-stage: framediff to acquire, CSRT to track. Designed for
-#                 camera-on-gimbal use where the camera itself moves.
+#   "tracker"   — two-stage: framediff acquires, MOSSE tracks. For camera-on-gimbal.
+#
+# Phase 4.5+:
+#   - capture_request() so we can read libcamera SensorTimestamp.
+#   - detect() and helpers accept an optional `timer` (instrument.StageTimer).
+#   - Tracker is MOSSE (was KCF). MOSSE is ~5-10x faster on Pi 4 and is
+#     sufficient for short-horizon tracking; the state machine handles loss.
+#   - Tracker now consumes the precomputed grayscale image instead of RGB.
 
+import time
 import cv2
 import numpy as np
 from picamera2 import Picamera2
 import config
 
 
+_CLOCK_BOOTTIME = getattr(time, "CLOCK_BOOTTIME", time.CLOCK_MONOTONIC)
+
+
+def _now_boottime_ns():
+    return time.clock_gettime_ns(_CLOCK_BOOTTIME)
+
+
+def _make_tracker():
+    """Build the fastest available correlation tracker.
+    Preference: MOSSE (legacy) > KCF (new API) > KCF (legacy)."""
+    try:
+        return cv2.legacy.TrackerMOSSE_create()
+    except (AttributeError, cv2.error):
+        pass
+    try:
+        return cv2.TrackerKCF_create()
+    except AttributeError:
+        return cv2.legacy.TrackerKCF_create()
+
+
 class MotionTracker:
-    # State machine for "tracker" mode
     STATE_SEARCHING = "searching"
     STATE_ACQUIRING = "acquiring"
     STATE_TRACKING  = "tracking"
@@ -40,26 +65,49 @@ class MotionTracker:
         else:
             raise ValueError(f"unknown mode {mode}")
 
-        # State for "tracker" mode
+        # Variable kept named `_csrt` for legacy reasons; actual tracker is
+        # built by _make_tracker() (MOSSE preferred).
         self._state = self.STATE_SEARCHING
         self._csrt = None
-        self._candidate_box = None       # bbox awaiting confirmation
-        self._tracker_lost_streak = 0    # how many consecutive update() failures
-        self._MAX_LOST = 5               # before declaring track dead
+        self._candidate_box = None
+        self._tracker_lost_streak = 0
+        self._MAX_LOST = 5
         self._last_bbox = None
 
-        # Smoothing on output position
         self._smooth_cx = None
         self._smooth_cy = None
         self._smooth_alpha = 0.6
 
+        self._last_sensor_ts_ns = 0
+
+    # ---- timestamp accessors ----
+
+    @property
+    def last_sensor_ts_ns(self):
+        return self._last_sensor_ts_ns
+
+    def sensor_age_ms(self):
+        if not self._last_sensor_ts_ns:
+            return float("nan")
+        return (_now_boottime_ns() - self._last_sensor_ts_ns) / 1e6
+
     # ---- shared utilities ----
 
-    def _read_frame(self):
-        """Capture and return (rgb_frame, gray_blurred)."""
-        frame = self.picam.capture_array()
+    def _read_frame(self, timer=None):
+        if timer is not None: timer.mark("capture")
+        request = self.picam.capture_request()
+        try:
+            frame = request.make_array("main")
+            metadata = request.get_metadata()
+            self._last_sensor_ts_ns = metadata.get("SensorTimestamp", 0)
+        finally:
+            request.release()
+        if timer is not None:
+            timer.lap("capture")
+            timer.mark("preproc")
         gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
         gray = cv2.GaussianBlur(gray, (11, 11), 0)
+        if timer is not None: timer.lap("preproc")
         return frame, gray
 
     def _smooth(self, raw_cx, raw_cy):
@@ -73,12 +121,9 @@ class MotionTracker:
         return int(self._smooth_cx), int(self._smooth_cy)
 
     def reset_background(self):
-        """Force a fresh background reference. Called after camera moves."""
         if self._mode == "framediff":
             self._prev_gray = None
         elif self._mode == "tracker":
-            # Don't reset CSRT — it's tracking the target, not the background.
-            # Only reset the search-stage prev_gray.
             self._prev_gray = None
         elif self._mode == "mog2":
             self._bgsub = cv2.createBackgroundSubtractorMOG2(
@@ -95,10 +140,9 @@ class MotionTracker:
     def is_tracking(self):
         return self._state == self.STATE_TRACKING
 
-    # ---- detection: framediff helper, used by both legacy and tracker modes ----
+    # ---- detection helpers ----
 
     def _framediff_largest_blob(self, gray):
-        """Return (bbox, area) of largest motion blob, or (None, 0)."""
         if self._prev_gray is None:
             self._prev_gray = gray
             return None, 0
@@ -119,19 +163,19 @@ class MotionTracker:
 
     # ---- public detect() — branches on mode ----
 
-    def detect(self):
-        frame, gray = self._read_frame()
-
+    def detect(self, timer=None):
+        frame, gray = self._read_frame(timer)
         if self._mode == "mog2":
-            return self._detect_mog2(frame, gray)
+            return self._detect_mog2(frame, gray, timer)
         elif self._mode == "framediff":
-            return self._detect_framediff(frame, gray)
-        else:  # tracker
-            return self._detect_tracker(frame, gray)
+            return self._detect_framediff(frame, gray, timer)
+        else:
+            return self._detect_tracker(frame, gray, timer)
 
     # ---- mode implementations ----
 
-    def _detect_mog2(self, frame, gray):
+    def _detect_mog2(self, frame, gray, timer=None):
+        if timer is not None: timer.mark("mog2")
         mask = self._bgsub.apply(gray, learningRate=0.005)
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
         mask = cv2.dilate(mask, None, iterations=2)
@@ -151,9 +195,11 @@ class MotionTracker:
         else:
             self._smooth_cx = None
             self._smooth_cy = None
+        if timer is not None: timer.lap("mog2")
         return frame, target, mask
 
-    def _detect_framediff(self, frame, gray):
+    def _detect_framediff(self, frame, gray, timer=None):
+        if timer is not None: timer.mark("framediff")
         bbox, area = self._framediff_largest_blob(gray)
         target = None
         if bbox is not None:
@@ -165,54 +211,51 @@ class MotionTracker:
         else:
             self._smooth_cx = None
             self._smooth_cy = None
-        # No mask returned for framediff (we don't need it)
+        if timer is not None: timer.lap("framediff")
         return frame, target, np.zeros_like(gray)
 
-    def _detect_tracker(self, frame, gray):
+    def _detect_tracker(self, frame, gray, timer=None):
         target = None
 
         if self._state in (self.STATE_SEARCHING, self.STATE_LOST):
-            # Look for motion to acquire
+            if timer is not None: timer.mark("framediff")
             bbox, area = self._framediff_largest_blob(gray)
+            if timer is not None: timer.lap("framediff")
             if bbox is not None:
                 self._candidate_box = bbox
                 self._state = self.STATE_ACQUIRING
-            # No actionable target yet
             return frame, None, np.zeros_like(gray)
 
         if self._state == self.STATE_ACQUIRING:
-            # Confirm motion is still there roughly where we saw it
+            if timer is not None: timer.mark("framediff")
             bbox, area = self._framediff_largest_blob(gray)
+            if timer is not None: timer.lap("framediff")
             if bbox is None:
-                # Fizzled — back to searching
                 self._state = self.STATE_SEARCHING
                 self._candidate_box = None
                 return frame, None, np.zeros_like(gray)
 
-            # Initialize CSRT on the confirmed bbox using the RGB frame
-            # (CSRT works on color, not grayscale)
-            try:
-                self._csrt = cv2.TrackerKCF_create()
-            except AttributeError:
-                self._csrt = cv2.legacy.TrackerKCF_create()
+            # Build the tracker (MOSSE preferred, KCF fallback)
+            if timer is not None: timer.mark("kcf_init")
+            self._csrt = _make_tracker()
 
-            # Expand the motion bbox into a torso-biased aim box. Framediff
-            # tends to find limbs (which move most); we want the tracker to
-            # lock onto the body, not the hand or shoulder.
+            # Expand the motion bbox into a torso-biased aim box.
             x, y, w, h = bbox
             fh = frame.shape[0]
-            # Expand height: 50% upward, 200% downward (toward feet), capped at frame
             new_h = int(h * 3.5)
             new_y = max(0, y - int(h * 0.5))
             new_h = min(new_h, fh - new_y)
-            # Slight horizontal expansion too, but less aggressive
             new_x = max(0, x - int(w * 0.3))
             new_w = int(w * 1.6)
             new_w = min(new_w, frame.shape[1] - new_x)
             bbox = (new_x, new_y, new_w, new_h)
             self._last_bbox = bbox
 
-            self._csrt.init(frame, bbox)
+            # Initialize on grayscale (faster than RGB; both KCF and MOSSE
+            # accept single-channel input).
+            self._csrt.init(gray, bbox)
+            if timer is not None: timer.lap("kcf_init")
+
             self._state = self.STATE_TRACKING
             self._tracker_lost_streak = 0
             self._candidate_box = None
@@ -225,15 +268,16 @@ class MotionTracker:
             return frame, target, np.zeros_like(gray)
 
         if self._state == self.STATE_TRACKING:
-            ok, bbox = self._csrt.update(frame)
+            if timer is not None: timer.mark("kcf_update")
+            ok, bbox = self._csrt.update(gray)
+            if timer is not None: timer.lap("kcf_update")
 
-            # KCF sometimes returns ok=True with a degenerate bbox. Validate.
             x, y, w, h = bbox
             fh, fw = frame.shape[:2]
             bbox_invalid = (
-                w < 20 or h < 20 or                  # collapsed
-                w > fw * 0.9 or h > fh * 0.9 or      # exploded
-                x < 0 or y < 0 or                    # out of frame
+                w < 20 or h < 20 or
+                w > fw * 0.9 or h > fh * 0.9 or
+                x < 0 or y < 0 or
                 x + w > fw or y + h > fh
             )
 
@@ -256,7 +300,6 @@ class MotionTracker:
             target = (cx, cy, w * h)
             return frame, target, np.zeros_like(gray)
 
-        # Shouldn't reach here
         return frame, None, np.zeros_like(gray)
 
     def close(self):
