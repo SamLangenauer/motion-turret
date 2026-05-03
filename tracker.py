@@ -1,11 +1,21 @@
 # tracker.py — closed-loop P-controller driving the turret to follow a tracked target.
 #
 # Phase 4.5+ instrumentation:
-#   - StageTimer logs per-frame stage durations to latency.csv and prints
-#     periodic p50/p95/p99/max summaries.
-#   - Stream encoding can be toggled at startup via the STREAM env var
-#     (STREAM=0 disables the MJPEG server and skips encoding entirely).
-#   - DURATION env var caps the run length in seconds (useful for benchmarks).
+#   - StageTimer logs per-stage latency to latency.csv with periodic summaries.
+#   - Stream encoding toggled via STREAM env var (STREAM=0 disables).
+#   - DURATION env var caps run length in seconds.
+#
+# Phase 5 (Kalman):
+#   - TargetKalman replaces the EMA smoother that was in vision.py.
+#   - Every frame with a valid detection feeds kalman.update(); the filter
+#     returns a smoothed position + velocity estimate.
+#   - The control loop aims at kalman.lead(KALMAN_LEAD_MS/1000) — the
+#     predicted position N ms from now — compensating for capture + servo lag.
+#   - During settle frames, kalman.predict() dead-reckons the target's position
+#     so the filter stays warm and velocity doesn't decay to zero.
+#   - kalman.reset() is called exactly when the vision state transitions to LOST,
+#     so a fresh acquisition gets a fresh filter with no stale velocity.
+#   - vx / vy (px/s) are logged to latency.csv for analysis.
 
 import threading
 import http.server
@@ -18,12 +28,19 @@ import config
 from servos import Turret
 from vision import MotionTracker
 from instrument import StageTimer
+from kalman import TargetKalman
 
 
 class Tracker:
     def __init__(self, enable_stream=True, latency_csv="latency.csv"):
         self.turret = Turret()
         self.vision = MotionTracker(mode="tracker")
+        self.kalman = TargetKalman(
+            frame_width=config.FRAME_WIDTH,
+            frame_height=config.FRAME_HEIGHT,
+            meas_noise_px=config.KALMAN_MEAS_NOISE_PX,
+            proc_noise=config.KALMAN_PROC_NOISE,
+        )
 
         self._frame_cx = config.FRAME_WIDTH // 2
         self._frame_cy = config.FRAME_HEIGHT // 2
@@ -34,7 +51,8 @@ class Tracker:
         self._lost_frames = 0
 
         self._last_frame = None
-        self._last_target = None
+        self._last_target = None        # Kalman-smoothed aim point for stream overlay
+        self._prev_vision_state = None  # track state transitions for kalman.reset()
 
         # Stream encoding state
         self._enable_stream = enable_stream
@@ -53,7 +71,7 @@ class Tracker:
         if self.timer is not None:
             self.timer.frame_begin()
 
-        # Warmup: run capture so the camera/AGC settles, but don't drive servos.
+        # Warmup: let camera/AGC settle; don't drive servos.
         if self._warmup_frames > 0:
             self.vision.detect(timer=self.timer)
             self._warmup_frames -= 1
@@ -64,33 +82,82 @@ class Tracker:
                 self.timer.frame_end()
             return None
 
-        # Settle: a servo command was just issued; wait for the gimbal to stop
-        # so framediff/KCF aren't seeing pure ego-motion.
+        # Settle: servo command was just issued; wait for gimbal to stop so
+        # framediff isn't seeing ego-motion.  Still update the Kalman filter
+        # (predict only) so it stays warm and velocity doesn't decay to zero.
         if self._settle > 0:
-            self.vision.detect(timer=self.timer)
+            frame, target, _ = self.vision.detect(timer=self.timer)
+            self._last_frame = frame
             self._settle -= 1
+
+            curr_state = self.vision.state
+            if target is not None:
+                # MOSSE managed a valid update through the motion — use it.
+                raw_cx, raw_cy, area = target
+                kx, ky, vx, vy = self.kalman.update(raw_cx, raw_cy)
+                self._last_target = (kx, ky, area)
+            else:
+                # Dead-reckon so velocity stays alive.
+                pred = self.kalman.predict()
+                if pred is not None:
+                    kx, ky, vx, vy = pred
+                    self._last_target = (kx, ky, 0)
+
+            self._handle_state_transition(curr_state)
+
             if self.timer is not None:
                 self.timer.note("phase", "settle")
                 self.timer.note("settle_remaining", self._settle)
-                self.timer.note("state", self.vision.state)
+                self.timer.note("state", curr_state)
                 self.timer.note("sensor_age_ms", f"{self.vision.sensor_age_ms():.2f}")
                 self.timer.frame_end()
             return None
 
-        # Active perception+control.
+        # ---- Active perception + control ----
         frame, target, _ = self.vision.detect(timer=self.timer)
         self._last_frame = frame
-        self._last_target = target
 
+        curr_state = self.vision.state
+        self._handle_state_transition(curr_state)
+
+        # --- Kalman update / predict ---
+        vx, vy = 0.0, 0.0
+        aim = None
+
+        if target is not None:
+            raw_cx, raw_cy, area = target
+            if self.timer is not None: self.timer.mark("kalman")
+            kx, ky, vx, vy = self.kalman.update(raw_cx, raw_cy)
+            # Lead-compensated aim: where will the target be in KALMAN_LEAD_MS?
+            speed = (vx**2 + vy**2) ** 0.5
+            if speed > 30 and config.KALMAN_LEAD_MS > 0:
+                lead = self.kalman.lead(config.KALMAN_LEAD_MS / 1000.0)
+                aim_cx, aim_cy = lead if lead else (kx, ky)
+            else:
+                aim_cx, aim_cy = kx, ky
+            if self.timer is not None: self.timer.lap("kalman")
+            aim = (aim_cx, aim_cy, area)
+        elif self.vision.is_tracking:
+            # MOSSE is in tracking state but returned no target this frame
+            # (e.g. brief occlusion). Dead-reckon rather than going blind.
+            pred = self.kalman.predict()
+            if pred is not None:
+                kx, ky, vx, vy = pred
+                aim = (kx, ky, 0)
+
+        self._last_target = aim
+
+        # --- Stream encode ---
         if self._enable_stream:
             if self.timer is not None: self.timer.mark("stream")
             self._maybe_encode_stream_frame()
             if self.timer is not None: self.timer.lap("stream")
 
+        # --- Servo control ---
         result = None
         commanded = False
 
-        if not self.vision.is_tracking or target is None:
+        if not self.vision.is_tracking or aim is None:
             self._lost_frames += 1
             if self._lost_frames > config.LOST_LOCK_FRAMES_TO_RECENTER:
                 if self.timer is not None: self.timer.mark("control")
@@ -99,7 +166,7 @@ class Tracker:
                 commanded = True
         else:
             self._lost_frames = 0
-            cx, cy, _area = target
+            cx, cy, _area = aim
             err_x = cx - self._frame_cx
             err_y = cy - self._frame_cy
 
@@ -122,16 +189,28 @@ class Tracker:
                     self.timer.note("dpan", f"{dpan:.2f}")
                     self.timer.note("dtilt", f"{dtilt:.2f}")
                     self.timer.note("settle_set", self._settle)
-            result = target
+
+            result = aim
 
         if self.timer is not None:
             self.timer.note("phase", "active")
-            self.timer.note("state", self.vision.state)
+            self.timer.note("state", curr_state)
             self.timer.note("commanded", "1" if commanded else "0")
             self.timer.note("sensor_age_ms", f"{self.vision.sensor_age_ms():.2f}")
+            self.timer.note("vx_px_s", f"{vx:.1f}")
+            self.timer.note("vy_px_s", f"{vy:.1f}")
             self.timer.frame_end()
 
         return result
+
+    # ---- helpers ----
+
+    def _handle_state_transition(self, curr_state: str):
+        """Reset the Kalman filter the moment the vision state goes LOST."""
+        if (curr_state in (MotionTracker.STATE_LOST, MotionTracker.STATE_SEARCHING)
+                and self._prev_vision_state == MotionTracker.STATE_TRACKING):
+            self.kalman.reset()
+        self._prev_vision_state = curr_state
 
     def _recenter_step(self):
         pan, tilt = self.turret.position
@@ -250,13 +329,7 @@ class Tracker:
 
 
 if __name__ == "__main__":
-    # Stream toggle:
-    #   STREAM=1 (default) — start MJPEG server, encode frames inline
-    #   STREAM=0           — disable streaming entirely (no encode, no server)
     enable_stream = os.environ.get("STREAM", "1") != "0"
-
-    # Optional run-length cap for benchmarks:
-    #   DURATION=60 python tracker.py    runs for 60 s then exits cleanly
     duration = os.environ.get("DURATION")
     duration = float(duration) if duration else None
 

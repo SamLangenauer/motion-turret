@@ -11,6 +11,11 @@
 #   - Tracker is MOSSE (was KCF). MOSSE is ~5-10x faster on Pi 4 and is
 #     sufficient for short-horizon tracking; the state machine handles loss.
 #   - Tracker now consumes the precomputed grayscale image instead of RGB.
+#
+# Phase 5 (Kalman):
+#   - EMA smoother (_smooth / _smooth_cx / _smooth_cy) removed entirely.
+#     tracker.py's TargetKalman now owns all smoothing and velocity estimation.
+#   - detect() returns raw centroid; no position filtering done here.
 
 import time
 import cv2
@@ -76,10 +81,6 @@ class MotionTracker:
         self._MAX_LOST = 5
         self._last_bbox = None
 
-        self._smooth_cx = None
-        self._smooth_cy = None
-        self._smooth_alpha = 0.45
-
         self._last_sensor_ts_ns = 0
 
     # ---- timestamp accessors ----
@@ -112,16 +113,6 @@ class MotionTracker:
         if timer is not None: timer.lap("preproc")
         return frame, gray
 
-    def _smooth(self, raw_cx, raw_cy):
-        if self._smooth_cx is None:
-            self._smooth_cx = float(raw_cx)
-            self._smooth_cy = float(raw_cy)
-        else:
-            a = self._smooth_alpha
-            self._smooth_cx = a * raw_cx + (1 - a) * self._smooth_cx
-            self._smooth_cy = a * raw_cy + (1 - a) * self._smooth_cy
-        return int(self._smooth_cx), int(self._smooth_cy)
-
     def reset_background(self):
         if self._mode == "framediff":
             self._prev_gray = None
@@ -131,8 +122,6 @@ class MotionTracker:
             self._bgsub = cv2.createBackgroundSubtractorMOG2(
                 history=200, varThreshold=16, detectShadows=False
             )
-        self._smooth_cx = None
-        self._smooth_cy = None
 
     @property
     def state(self):
@@ -190,13 +179,9 @@ class MotionTracker:
             if area >= config.MIN_CONTOUR_AREA:
                 x, y, w, h = cv2.boundingRect(largest)
                 if w > 0 and h > 0:
-                    raw_cx = x + w // 2
-                    raw_cy = y + int(h * config.AIM_VERTICAL_BIAS)
-                    cx, cy = self._smooth(raw_cx, raw_cy)
+                    cx = x + w // 2
+                    cy = y + int(h * config.AIM_VERTICAL_BIAS)
                     target = (cx, cy, area)
-        else:
-            self._smooth_cx = None
-            self._smooth_cy = None
         if timer is not None: timer.lap("mog2")
         return frame, target, mask
 
@@ -206,13 +191,9 @@ class MotionTracker:
         target = None
         if bbox is not None:
             x, y, w, h = bbox
-            raw_cx = x + w // 2
-            raw_cy = y + int(h * config.AIM_VERTICAL_BIAS)
-            cx, cy = self._smooth(raw_cx, raw_cy)
+            cx = x + w // 2
+            cy = y + int(h * config.AIM_VERTICAL_BIAS)
             target = (cx, cy, area)
-        else:
-            self._smooth_cx = None
-            self._smooth_cy = None
         if timer is not None: timer.lap("framediff")
         return frame, target, np.zeros_like(gray)
 
@@ -241,7 +222,6 @@ class MotionTracker:
             if timer is not None: timer.mark("kcf_init")
             self._csrt = _make_tracker()
 
-            # Expand the motion bbox into a torso-biased aim box.
             x, y, w, h = bbox
             fh = frame.shape[0]
             new_h = int(h * 2.0)
@@ -250,30 +230,19 @@ class MotionTracker:
             new_w = int(w * 1.2)
             new_x = max(0, x - int(w * 0.1))
             new_w = min(new_w, frame.shape[1] - new_x)
-            
-            # --- BEGIN CPU SAFETY CLAMP ---
-            # If the box is massive, shrink the tracking area to the core center 
-            # to prevent the Pi from choking on the initialization math.
+
             MAX_DIM = 250
             if new_w > MAX_DIM or new_h > MAX_DIM:
-                # Find the center of the expanded box
                 cx = new_x + (new_w // 2)
                 cy = new_y + (new_h // 2)
-                # Clamp dimensions
                 new_w = min(new_w, MAX_DIM)
                 new_h = min(new_h, MAX_DIM)
-                # Re-center the smaller box
                 new_x = cx - (new_w // 2)
                 new_y = cy - (new_h // 2)
-            # --- END CPU SAFETY CLAMP ---
 
             bbox = (new_x, new_y, new_w, new_h)
             self._last_bbox = bbox
-
-            # Initialize on FULL resolution, but with a safely sized box
             self._csrt.init(gray, bbox)
-
-            # Initialize on FULL resolution
             if timer is not None: timer.lap("kcf_init")
 
             self._state = self.STATE_TRACKING
@@ -281,29 +250,25 @@ class MotionTracker:
             self._candidate_box = None
 
             x, y, w, h = bbox
-            raw_cx = x + w // 2
-            raw_cy = y + int(h * config.AIM_VERTICAL_BIAS)
-            cx, cy = self._smooth(raw_cx, raw_cy)
+            cx = x + w // 2
+            cy = y + int(h * config.AIM_VERTICAL_BIAS)
             target = (cx, cy, w * h)
             return frame, target, np.zeros_like(gray)
 
         if self._state == self.STATE_TRACKING:
             if timer is not None: timer.mark("kcf_update")
-            
-            # Update on FULL resolution
             ok, bbox = self._csrt.update(gray)
             if timer is not None: timer.lap("kcf_update")
 
             fh, fw = frame.shape[:2]
-            
-            # We must explicitly convert the tuple floats back to ints to prevent type errors
+
             if ok:
                 x, y, w, h = [int(v) for v in bbox]
                 bbox = (x, y, w, h)
             else:
                 x, y, w, h = 0, 0, 0, 0
                 bbox = (0, 0, 0, 0)
-                
+
             bbox_invalid = (
                 w < 20 or h < 20 or
                 w > fw * 0.9 or h > fh * 0.9 or
@@ -317,16 +282,14 @@ class MotionTracker:
                     self._state = self.STATE_LOST
                     self._csrt = None
                     self._last_bbox = None
-                    self._smooth_cx = None
-                    self._smooth_cy = None
                 return frame, None, np.zeros_like(gray)
 
             self._tracker_lost_streak = 0
             self._last_bbox = bbox
 
-            raw_cx = int(x + w / 2)
-            raw_cy = int(y + h * config.AIM_VERTICAL_BIAS)
-            cx, cy = self._smooth(raw_cx, raw_cy)
+            x, y, w, h = bbox
+            cx = int(x + w / 2)
+            cy = int(y + h * config.AIM_VERTICAL_BIAS)
             target = (cx, cy, w * h)
             return frame, target, np.zeros_like(gray)
 
