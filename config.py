@@ -20,7 +20,6 @@ SERVO_MAX_PULSE = 2500
 # --- Camera ---
 FRAME_WIDTH = 680
 FRAME_HEIGHT = 480
-FRAME_RATE = 30
 
 # --- Motion detection ---
 MOTION_THRESHOLD = 25

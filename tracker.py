@@ -315,26 +315,6 @@ class Tracker:
             
         self._prev_vision_state = curr_state
 
-    def _recenter_step(self):
-        pan, tilt = self.turret.position
-        step = config.RECENTER_STEP_DEG
-
-        dpan = 0.0
-        if pan < config.PAN_CENTER - step:
-            dpan = step
-        elif pan > config.PAN_CENTER + step:
-            dpan = -step
-
-        dtilt = 0.0
-        if tilt < config.TILT_CENTER - step:
-            dtilt = step
-        elif tilt > config.TILT_CENTER + step:
-            dtilt = -step
-
-        if dpan or dtilt:
-            self.turret.nudge(dpan, dtilt)
-            self._settle = self._SETTLE_FRAMES
-
     # ---- stream frame encoder (runs inline in main thread) ----
 
     def _maybe_encode_stream_frame(self):
