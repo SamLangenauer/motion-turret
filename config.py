@@ -11,7 +11,7 @@ PAN_CENTER = 90
 
 TILT_MIN_ANGLE = 58
 TILT_MAX_ANGLE = 177
-TILT_CENTER = 130
+TILT_CENTER = 115
 
 # PCA9685 pulse width range in microseconds.
 SERVO_MIN_PULSE = 500
@@ -31,7 +31,9 @@ AIM_VERTICAL_BIAS = 0.45
 # --- Tracking control ---
 KP_PAN = 0.035
 KP_TILT = 0.035
-DEADZONE_PIXELS = 35
+KD_PAN = 0.025
+KD_TILT = 0.025
+DEADZONE_PIXELS = 22.5
 
 # --- Kalman filter (Phase 5) ---
 # Measurement noise: how noisy are raw detections (pixels std dev).
@@ -61,4 +63,4 @@ LOST_LOCK_FRAMES_TO_RECENTER = 45
 RECENTER_STEP_DEG = 1.5
 
 # Slew rate limit
-MAX_NUDGE_DEG = 10
+MAX_NUDGE_DEG = 15

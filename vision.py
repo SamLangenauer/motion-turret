@@ -30,10 +30,8 @@ _CLOCK_BOOTTIME = getattr(time, "CLOCK_BOOTTIME", time.CLOCK_MONOTONIC)
 def _now_boottime_ns():
     return time.clock_gettime_ns(_CLOCK_BOOTTIME)
 
-
 def _make_tracker():
-    """Build the fastest available correlation tracker.
-    Preference: MOSSE (legacy) > KCF (new API) > KCF (legacy)."""
+    """Build the fastest available correlation tracker (MOSSE)."""
     try:
         return cv2.legacy.TrackerMOSSE_create()
     except (AttributeError, cv2.error):
@@ -42,7 +40,6 @@ def _make_tracker():
         return cv2.TrackerKCF_create()
     except AttributeError:
         return cv2.legacy.TrackerKCF_create()
-
 
 class MotionTracker:
     STATE_SEARCHING = "searching"
@@ -61,6 +58,11 @@ class MotionTracker:
         )
         self.picam.configure(video_config)
         self.picam.start()
+
+        self.net = cv2.dnn.readNetFromCaffe(
+            "MobileNetSSD_deploy.prototxt", 
+            "MobileNetSSD_deploy.caffemodel"
+        )
 
         self._mode = mode
         if mode == "mog2":
@@ -197,54 +199,89 @@ class MotionTracker:
         if timer is not None: timer.lap("framediff")
         return frame, target, np.zeros_like(gray)
 
+    def _detect_human(self, frame):
+        """Scans for humans using a MobileNet-SSD Neural Network."""
+        h, w = frame.shape[:2]
+        
+        # Format the image for the neural net (300x300 is what MobileNet expects)
+        blob = cv2.dnn.blobFromImage(cv2.resize(frame, (300, 300)), 
+                                     0.007843, (300, 300), 127.5)
+        self.net.setInput(blob)
+        detections = self.net.forward()
+
+        best_box = None
+        max_area = 0
+
+        # Loop over the detections
+        for i in np.arange(0, detections.shape[2]):
+            confidence = detections[0, 0, i, 2]
+
+            # Filter out weak detections (tune this between 0.4 and 0.6)
+            if confidence > 0.5:
+                # Extract the class ID (Class 15 is 'Person' in MobileNet-SSD)
+                idx = int(detections[0, 0, i, 1])
+                
+                if idx == 15:
+                    # Compute the (x, y) coordinates of the bounding box
+                    box = detections[0, 0, i, 3:7] * np.array([w, h, w, h])
+                    (startX, startY, endX, endY) = box.astype("int")
+                    
+                    # Ensure bounding box is within frame
+                    startX, startY = max(0, startX), max(0, startY)
+                    endX, endY = min(w - 1, endX), min(h - 1, endY)
+                    
+                    bw = endX - startX
+                    bh = endY - startY
+                    area = bw * bh
+                    
+                    if area > max_area:
+                        max_area = area
+                        best_box = (startX, startY, bw, bh)
+
+        if best_box is None:
+            return None, 0
+            
+        return best_box, max_area
+
     def _detect_tracker(self, frame, gray, timer=None):
         target = None
 
         if self._state in (self.STATE_SEARCHING, self.STATE_LOST):
-            if timer is not None: timer.mark("framediff")
-            bbox, area = self._framediff_largest_blob(gray)
-            if timer is not None: timer.lap("framediff")
-            if bbox is not None:
-                self._candidate_box = bbox
-                self._state = self.STATE_ACQUIRING
-            return frame, None, np.zeros_like(gray)
+            if timer is not None: timer.mark("dnn_search")
+            bbox, area = self._detect_human(frame)
+            if timer is not None: timer.lap("dnn_search")
 
-        if self._state == self.STATE_ACQUIRING:
-            if timer is not None: timer.mark("framediff")
-            bbox, area = self._framediff_largest_blob(gray)
-            if timer is not None: timer.lap("framediff")
-            if bbox is None:
-                self._state = self.STATE_SEARCHING
-                self._candidate_box = None
+            # If no human found, keep searching
+            if bbox is None or area <= 2000:
                 return frame, None, np.zeros_like(gray)
 
-            # Build the tracker
-            if timer is not None: timer.mark("kcf_init")
+            # --- Human found! Initialize MOSSE immediately ---
+            if timer is not None: timer.mark("kcf_init") 
             self._csrt = _make_tracker()
 
             x, y, w, h = bbox
-            fh = frame.shape[0]
-            new_h = int(h * 2.0)
-            new_y = max(0, y - int(h * 0.2))
-            new_h = min(new_h, fh - new_y)
-            new_w = int(w * 1.2)
-            new_x = max(0, x - int(w * 0.1))
-            new_w = min(new_w, frame.shape[1] - new_x)
-
-            MAX_DIM = 250
-            if new_w > MAX_DIM or new_h > MAX_DIM:
-                cx = new_x + (new_w // 2)
-                cy = new_y + (new_h // 2)
-                new_w = min(new_w, MAX_DIM)
-                new_h = min(new_h, MAX_DIM)
-                new_x = cx - (new_w // 2)
-                new_y = cy - (new_h // 2)
-
-            bbox = (new_x, new_y, new_w, new_h)
+            
+            # --- THE FIX: Tight upper-body crop for MOSSE ---
+            # Don't inflate the box. MobileNet already found the whole body.
+            # We want a tight patch on the head/chest so MOSSE doesn't memorize the wall.
+            track_w = min(int(w * 0.6), 150)
+            track_h = min(int(h * 0.4), 150)
+            
+            # Center it horizontally, shift it up to the head/chest area
+            track_x = x + (w // 2) - (track_w // 2)
+            track_y = y + int(h * 0.1)
+            
+            # Clamp to frame boundaries so we don't crash at the edges
+            fh, fw = frame.shape[:2]
+            track_x = max(0, min(track_x, fw - track_w))
+            track_y = max(0, min(track_y, fh - track_h))
+            
+            bbox = (int(track_x), int(track_y), int(track_w), int(track_h))
             self._last_bbox = bbox
             self._csrt.init(gray, bbox)
             if timer is not None: timer.lap("kcf_init")
 
+            # Jump straight to tracking
             self._state = self.STATE_TRACKING
             self._tracker_lost_streak = 0
             self._candidate_box = None

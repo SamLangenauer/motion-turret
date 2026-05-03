@@ -25,3 +25,4 @@ captures/       # if you later save camera frames for debug
 *.avi
 latency.csv
 __pycache__/
+*.caffemodel

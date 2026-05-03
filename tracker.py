@@ -44,11 +44,23 @@ class Tracker:
 
         self._frame_cx = config.FRAME_WIDTH // 2
         self._frame_cy = config.FRAME_HEIGHT // 2
+        
+        self._sync_counter = 0
+        
+        self._sync_thread = None
+        self._sync_result = None
+        self._sync_lock = threading.Lock()
 
         self._SETTLE_FRAMES = 2
         self._settle = 0
         self._warmup_frames = 30
         self._lost_frames = 0
+        self._track_streak = 0
+
+        self._patrol_direction = -1  # 1 for right, -1 for left
+        self._patrol_speed = 5       # Degrees per frame to pan
+        self._patrol_max = config.PAN_MAX_ANGLE
+        self._patrol_min = config.PAN_MIN_ANGLE
 
         self._last_frame = None
         self._last_target = None        # Kalman-smoothed aim point for stream overlay
@@ -64,8 +76,17 @@ class Tracker:
 
         # Latency instrumentation. Pass latency_csv=None to disable.
         self.timer = StageTimer(latency_csv, summary_every=60) if latency_csv else None
+        self._prev_err_x = 0.0
+        self._prev_err_y = 0.0
 
     # ---- main control loop ----
+    def _run_dnn_sync(self, frame_copy):
+        """Runs the heavy neural network on a background thread."""
+        bbox, area = self.vision._detect_human(frame_copy)
+        
+        # Safely hand the result back to the main thread
+        with self._sync_lock:
+            self._sync_result = (bbox, area)
 
     def step(self):
         if self.timer is not None:
@@ -105,6 +126,11 @@ class Tracker:
 
             self._handle_state_transition(curr_state)
 
+            if self._enable_stream:
+                if self.timer is not None: self.timer.mark("stream")
+                self._maybe_encode_stream_frame()
+                if self.timer is not None: self.timer.lap("stream")
+
             if self.timer is not None:
                 self.timer.note("phase", "settle")
                 self.timer.note("settle_remaining", self._settle)
@@ -114,6 +140,41 @@ class Tracker:
             return None
 
         # ---- Active perception + control ----
+
+        # --- THE FIX: Asynchronous DNN Course-Correction ---
+        self._sync_counter += 1
+        if self.vision.is_tracking and self._sync_counter > 30 and self._last_frame is not None:
+            # Only start a new thread if the old one is finished
+            if self._sync_thread is None or not self._sync_thread.is_alive():
+                # MUST copy the frame so the main thread doesn't overwrite it while the DNN is reading
+                frame_copy = self._last_frame.copy() 
+                self._sync_thread = threading.Thread(target=self._run_dnn_sync, args=(frame_copy,))
+                self._sync_thread.daemon = True
+                self._sync_thread.start()
+            self._sync_counter = 0 # Reset timer
+
+        # Check if the background thread has finished and handed us a new bounding box
+        with self._sync_lock:
+            if self._sync_result is not None:
+                bbox, area = self._sync_result
+                self._sync_result = None # Clear the result so we don't apply it twice
+                
+                if bbox is not None and area > 2000:
+                    if self.timer is not None: self.timer.mark("kcf_init")
+                    # Re-initialize MOSSE with the perfect upper-body crop
+                    x, y, w, h = bbox
+                    track_w = min(int(w * 0.6), 150)
+                    track_h = min(int(h * 0.4), 150)
+                    track_x = max(0, min(x + (w // 2) - (track_w // 2), config.FRAME_WIDTH - track_w))
+                    track_y = max(0, min(y + int(h * 0.1), config.FRAME_HEIGHT - track_h))
+                    
+                    self.vision._csrt = _cv2.legacy.TrackerMOSSE_create()
+                    gray_frame = _cv2.cvtColor(self._last_frame, _cv2.COLOR_BGR2GRAY)
+                    self.vision._csrt.init(gray_frame, (int(track_x), int(track_y), int(track_w), int(track_h)))
+                    self.kalman.reset()
+                    if self.timer is not None: self.timer.lap("kcf_init")
+
+        # Normal vision step...
         frame, target, _ = self.vision.detect(timer=self.timer)
         self._last_frame = frame
 
@@ -159,21 +220,58 @@ class Tracker:
 
         if not self.vision.is_tracking or aim is None:
             self._lost_frames += 1
+            self._track_streak = 0
+
+            # If we've been lost for a bit, start patrolling
             if self._lost_frames > config.LOST_LOCK_FRAMES_TO_RECENTER:
                 if self.timer is not None: self.timer.mark("control")
-                self._recenter_step()
+                
+                # --- PATROL LOGIC ---
+                pan, tilt = self.turret.position
+                
+                # Slowly pan back and forth
+                next_pan = pan + (self._patrol_speed * self._patrol_direction)
+                if next_pan > self._patrol_max:
+                    self._patrol_direction = -1
+                elif next_pan < self._patrol_min:
+                    self._patrol_direction = 1
+                    
+                # Gently guide tilt back to center during patrol
+                dtilt = 0
+                if tilt < config.TILT_CENTER - 1: dtilt = 1
+                elif tilt > config.TILT_CENTER + 1: dtilt = -1
+
+                dpan = (self._patrol_speed * self._patrol_direction)
+                
+                self.turret.nudge(dpan, dtilt)
+                # Give it a tiny settle time so the HOG detector doesn't get a blurry frame
+                self._settle = 1 
+                
                 if self.timer is not None: self.timer.lap("control")
                 commanded = True
+
         else:
             self._lost_frames = 0
+            self._track_streak += 1
             cx, cy, _area = aim
             err_x = cx - self._frame_cx
             err_y = cy - self._frame_cy
 
-            if abs(err_x) >= config.DEADZONE_PIXELS or \
-               abs(err_y) >= config.DEADZONE_PIXELS:
-                dpan  =  config.KP_PAN  * err_x
-                dtilt = -config.KP_TILT * err_y
+            if abs(err_x) >= config.DEADZONE_PIXELS or abs(err_y) >= config.DEADZONE_PIXELS:
+                
+                # Calculate the rate of change (Derivative)
+                d_err_x = err_x - self._prev_err_x
+                d_err_y = err_y - self._prev_err_y
+
+                # PD Control Math
+                dpan  = (config.KP_PAN * err_x) + (config.KD_PAN * d_err_x)
+                dtilt = -(config.KP_TILT * err_y) - (config.KD_TILT * d_err_y)
+                
+                # Save current error for next frame
+                self._prev_err_x = err_x
+                self._prev_err_y = err_y
+
+                # Clamp to the new, higher max speed
                 dpan  = max(-config.MAX_NUDGE_DEG, min(config.MAX_NUDGE_DEG, dpan))
                 dtilt = max(-config.MAX_NUDGE_DEG, min(config.MAX_NUDGE_DEG, dtilt))
 
@@ -204,12 +302,17 @@ class Tracker:
         return result
 
     # ---- helpers ----
-
     def _handle_state_transition(self, curr_state: str):
-        """Reset the Kalman filter the moment the vision state goes LOST."""
+        """Reset the Kalman filter and vision background when lock is lost."""
         if (curr_state in (MotionTracker.STATE_LOST, MotionTracker.STATE_SEARCHING)
                 and self._prev_vision_state == MotionTracker.STATE_TRACKING):
             self.kalman.reset()
+            self.vision.reset_background()
+            
+            # THE FIX: Force a settle period to blind the frame-differencer
+            # while the physical gimbal mount stops vibrating from the sudden halt.
+            self._settle = max(self._settle, self._SETTLE_FRAMES * 5) 
+            
         self._prev_vision_state = curr_state
 
     def _recenter_step(self):
