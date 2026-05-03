@@ -74,11 +74,17 @@ class RemoteVisionClient:
         self._last_bbox = None           # (x, y, w, h) synthesised from cx/cy
         self._last_cx   = None
         self._last_cy   = None
-        self._last_area = 0
+        self._last_bbox_w = 0
+        self._last_bbox_h = 0
         self._last_conf = 0.0
         self._coord_ts  = 0.0            # monotonic time of last received packet
+        self._coord_frame_id = -1            # frame_id of last received coord packet
         self._frame_id  = 0
         self._last_sensor_ts_ns = 0
+        # Telemetry included in each frame sent to laptop
+        self._tel_lidar_dist = 0    # cm, 0 = no reading
+        self._tel_lidar_str  = 0
+        self._track_start_ts = 0.0  # monotonic time when lock was acquired
 
     # ------------------------------------------------------------------ #
     # MotionTracker-compatible interface                                   #
@@ -95,6 +101,25 @@ class RemoteVisionClient:
     @property
     def last_bbox(self):
         return self._last_bbox
+
+    @property
+    def coord_frame_id(self):
+        """Frame ID of the most recently received coord packet.
+        tracker.py compares this against the last frame it commanded on
+        to avoid issuing multiple servo moves for the same stale coord."""
+        return self._coord_frame_id
+
+    def update_telemetry(self, lidar_dist_cm: int, lidar_strength: int):
+        """Called by tracker.py each frame with the latest LiDAR reading."""
+        self._tel_lidar_dist = lidar_dist_cm
+        self._tel_lidar_str  = lidar_strength
+
+    @property
+    def track_ms(self) -> int:
+        """Milliseconds continuously locked on target, 0 if not tracking."""
+        if self._state != self.STATE_TRACKING or self._track_start_ts == 0.0:
+            return 0
+        return int((time.monotonic() - self._track_start_ts) * 1000)
 
     def sensor_age_ms(self):
         if not self._last_sensor_ts_ns:
@@ -156,7 +181,9 @@ class RemoteVisionClient:
             return
         self._frame_id = (self._frame_id + 1) & 0xFFFFFFFF
         pkt = encode_frame(self._frame_id, jpeg,
-                           config.FRAME_WIDTH, config.FRAME_HEIGHT)
+                           config.FRAME_WIDTH, config.FRAME_HEIGHT,
+                           self._tel_lidar_dist, self._tel_lidar_str,
+                           self.track_ms)
         try:
             self._tx.sendto(pkt, self._laptop)
         except OSError:
@@ -176,23 +203,30 @@ class RemoteVisionClient:
             return
 
         try:
-            frame_id, state_int, cx, cy, area, conf = decode_coord(latest)
+            frame_id, state_int, cx, cy, bbox_w, bbox_h, conf = decode_coord(latest)
         except Exception:
             return
 
+        prev_state      = self._state
         self._state     = state_str(state_int)
+        # Start/stop lock timer on state transitions
+        if self._state == self.STATE_TRACKING and prev_state != self.STATE_TRACKING:
+            self._track_start_ts = time.monotonic()
+        elif self._state != self.STATE_TRACKING:
+            self._track_start_ts = 0.0
         self._last_cx   = cx
         self._last_cy   = cy
-        self._last_area = area
+        self._last_bbox_w = bbox_w
+        self._last_bbox_h = bbox_h
         self._last_conf = conf
         self._coord_ts  = time.monotonic()
+        self._coord_frame_id = frame_id
 
-        # Synthesise a rough bbox for the stream overlay (centred square)
-        if self._state == self.STATE_TRACKING and area > 0:
-            side = int(area ** 0.5)
-            x = max(0, cx - side // 2)
-            y = max(0, cy - side // 2)
-            self._last_bbox = (x, y, side, side)
+        # Build overlay bbox from exact dimensions sent by the laptop
+        if self._state == self.STATE_TRACKING and bbox_w > 0 and bbox_h > 0:
+            x = max(0, cx - bbox_w // 2)
+            y = max(0, cy - int(bbox_h * 0.5))
+            self._last_bbox = (x, y, bbox_w, bbox_h)
         else:
             self._last_bbox = None
 
@@ -206,7 +240,8 @@ class RemoteVisionClient:
         if age_ms > COORD_STALE_MS:
             self._state = self.STATE_LOST
             return None
-        return (self._last_cx, self._last_cy, self._last_area)
+        return (self._last_cx, self._last_cy,
+                self._last_bbox_w * self._last_bbox_h)
 
     def close(self):
         self.picam.stop()

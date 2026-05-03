@@ -91,6 +91,9 @@ class Tracker:
         self.timer = StageTimer(latency_csv, summary_every=60) if latency_csv else None
         self._prev_err_x = 0.0
         self._prev_err_y = 0.0
+        # Remote mode: track last coord frame_id we issued a command on.
+        # Prevents multiple servo nudges from the same stale laptop coord.
+        self._last_commanded_coord_id = -1
 
     # ---- async DNN ----
 
@@ -259,7 +262,16 @@ class Tracker:
             cx, cy, _area = gated_aim
             err_x = cx - self._frame_cx
             err_y = cy - self._frame_cy
-            if abs(err_x) >= config.DEADZONE_PIXELS or abs(err_y) >= config.DEADZONE_PIXELS:
+            # In remote mode, only command when we have a genuinely new
+            # coord from the laptop — prevents 3-5x repeated nudges from
+            # the same stale packet while the Pi outruns the laptop's CV.
+            coord_id = (getattr(self.vision, "coord_frame_id", -2)
+                        if config.REMOTE_VISION else -2)
+            fresh_coord = (not config.REMOTE_VISION or
+                           coord_id != self._last_commanded_coord_id)
+
+            if fresh_coord and (abs(err_x) >= config.DEADZONE_PIXELS or
+                                abs(err_y) >= config.DEADZONE_PIXELS):
                 d_err_x = err_x - self._prev_err_x
                 d_err_y = err_y - self._prev_err_y
                 dpan  = (config.KP_PAN  * err_x) + (config.KD_PAN  * d_err_x)
@@ -272,6 +284,7 @@ class Tracker:
                 self.turret.nudge(dpan, dtilt)
                 if self.timer is not None: self.timer.lap("control")
                 commanded = True
+                self._last_commanded_coord_id = coord_id
                 max_step = max(abs(dpan), abs(dtilt))
                 self._settle = max(self._SETTLE_FRAMES, int(round(max_step / 3.0)))
                 if self.timer is not None:
@@ -312,7 +325,7 @@ class Tracker:
 
     def _handle_state_transition(self, curr_state):
         if (curr_state in (_VisionClass.STATE_LOST, _VisionClass.STATE_SEARCHING)
-            and self._prev_vision_state == _VisionClass.STATE_TRACKING):
+                and self._prev_vision_state == _VisionClass.STATE_TRACKING):
             # Don't reset Kalman here — let it dead-reckon for KALMAN_GRACE_FRAMES.
             # _dnn_worker will call kalman.reset() when it finds someone new.
             self._kalman_grace = KALMAN_GRACE_FRAMES
