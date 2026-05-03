@@ -55,11 +55,33 @@ KALMAN_LEAD_MS = 0.0
 # --- TF-Luna (Phase 6) ---
 LIDAR_SERIAL_PORT = "/dev/serial0"
 LIDAR_BAUD = 115200
+ 
+# Set False to disable LiDAR entirely (e.g. sensor not connected).
+# When False the tracker behaves exactly as Phase 5 — no range gating at all.
+LIDAR_ENABLED = True
+ 
+# Reject targets beyond this distance.  Tune to your room / use-case.
+# TF-Luna rated range: 0.2 – 8 m (indoor, white target).
 LIDAR_MAX_RANGE_CM = 300
+ 
+# Reject targets closer than this (suppresses close-range noise / ground returns).
+# Anything under ~20 cm is usually sensor noise or a stray reflection.
+LIDAR_MIN_RANGE_CM = 20
 
 # Loss-of-lock recovery
 LOST_LOCK_FRAMES_TO_RECENTER = 45
-RECENTER_STEP_DEG = 1.5
+RECENTER_STEP_DEG = 1
 
 # Slew rate limit
 MAX_NUDGE_DEG = 15
+
+REMOTE_VISION = True
+LAPTOP_IP = "100.69.0.24"
+# UDP ports.  Pi listens on COORD_RX_PORT; laptop listens on FRAME_TX_PORT.
+FRAME_TX_PORT = 5005    # Pi → Laptop (JPEG frames)
+COORD_RX_PORT = 5006    # Laptop → Pi (coord packets)
+ 
+# JPEG quality for frame transmission.  Lower = smaller packet, more
+# compression artefacts.  40 is a good starting point; drop to 30 if
+# you're seeing UDP drops (check with --preview on the laptop).
+REMOTE_FRAME_QUALITY = 40

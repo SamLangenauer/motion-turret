@@ -11,7 +11,7 @@ A low-latency, 2-axis pan/tilt turret that detects and tracks humans using a Ras
 | Servo driver | PCA9685 16-channel PWM (I²C) |
 | Servos | 2× GH-S37D 3.7g micro servos |
 | Laser | 5V 5mW 650nm red laser diode |
-| LiDAR | TF-Luna (driver ready, not yet integrated) |
+| LiDAR | TF-Luna (UART, range-gating active) |
 | Power | Dedicated regulated 5V supply → PCA9685 terminal block |
 | Mount | 3D-printed 2-axis pan/tilt gimbal |
 
@@ -28,9 +28,14 @@ Camera (80 FPS)
             ├── every ~30 frames: async MobileNet-SSD re-lock on background thread
             │       └── on detection: re-initialize MOSSE with corrected bbox
             │
-            └── Kalman filter [cx, cy, vx, vy]
-                    └── velocity-gated lead compensation
-                            └── PD controller → PCA9685 → servos
+            ├── Kalman filter [cx, cy, vx, vy]
+            │       └── velocity-gated lead compensation
+            │               └── PD controller → PCA9685 → servos
+            │
+            └── TF-Luna (background thread, ~100 Hz)
+                    └── range gate: suppress aim point if outside
+                        [LIDAR_MIN_RANGE_CM, LIDAR_MAX_RANGE_CM]
+                        (Kalman filter stays warm; only servo command suppressed)
 ```
 
 **Key design decisions:**
@@ -38,18 +43,21 @@ Camera (80 FPS)
 - MobileNet-SSD only runs on the background thread during tracking — it never blocks the main loop
 - Kalman lead compensation is gated on `speed > 30 px/s` so a stationary target isn't pushed off by stale velocity
 - On LOST transition: Kalman resets, frame-differencer background resets, and a forced settle period absorbs gimbal vibration before framediff restarts
+- LiDAR runs on its own daemon thread; `.get()` returns the latest reading in O(1) — no serial I/O in the hot path
+- Range gate is **fail-open**: if the sensor has no fresh reading, the aim point passes through unchanged so a momentary glitch doesn't break lock
+- The Kalman filter is **not** reset on a range-gate hit — only the servo command is suppressed. This keeps velocity estimates live so re-entry into range is handled smoothly
 
 ## File Structure
 
 ```
 motion-turret/
-├── tracker.py          # Main control loop: PD controller, patrol, async DNN sync
+├── tracker.py          # Main control loop: PD controller, patrol, async DNN sync, range gate
 ├── vision.py           # Camera capture, MobileNet-SSD acquisition, MOSSE tracking
 ├── kalman.py           # Constant-velocity Kalman filter with lead compensation
 ├── servos.py           # PCA9685 servo wrapper with angle clamping
 ├── instrument.py       # Per-stage latency timer → CSV + p50/p95/p99 summaries
-├── config.py           # All tuning constants (gains, noise, limits)
-├── lidar.py            # TF-Luna UART driver (ready, not yet wired into tracker)
+├── config.py           # All tuning constants (gains, noise, limits, lidar thresholds)
+├── lidar.py            # TF-Luna UART driver + non-blocking LidarReader thread
 ├── MobileNetSSD_deploy.prototxt   # Network architecture
 ├── MobileNetSSD_deploy.caffemodel # Pre-trained weights (not in repo — see below)
 └── tests/
@@ -80,12 +88,13 @@ wget https://github.com/chuanqi305/MobileNet-SSD/raw/master/mobilenet_iter_73000
      -O MobileNetSSD_deploy.caffemodel
 ```
 
-### 3. Enable camera and I²C
+### 3. Enable camera, I²C, and UART
 
 ```bash
 sudo raspi-config
 # Interface Options → Camera → Enable
 # Interface Options → I2C → Enable
+# Interface Options → Serial Port → Enable (disable login shell, enable hardware)
 ```
 
 ### 4. Verify hardware
@@ -96,6 +105,15 @@ rpicam-hello --list-cameras
 
 # Check PCA9685
 i2cdetect -y 1   # should show 0x40
+
+# Check TF-Luna
+python3 - <<'EOF'
+from lidar import TFLuna
+luna = TFLuna()
+for _ in range(5):
+    print(luna.read())
+luna.close()
+EOF
 
 # Manual servo test
 python3 tests/test_servos.py
@@ -114,9 +132,13 @@ STREAM=0 python3 tracker.py
 
 # Timed benchmark run
 DURATION=60 python3 tracker.py
+
+# Run without LiDAR (sensor not connected)
+# Set LIDAR_ENABLED = False in config.py
 ```
 
-View the live stream at `http://<pi-ip>:8080/`.
+View the live stream at `http://<pi-ip>:8080/`.  
+When range gating fires, the target box and aim dot turn **orange** in the stream.
 
 ## Tuning
 
@@ -131,6 +153,9 @@ All tuning constants are in `config.py`.
 | `KALMAN_MEAS_NOISE_PX` | Higher = smoother crosshair, slightly more lag |
 | `KALMAN_PROC_NOISE` | Higher = faster velocity adaptation |
 | `KALMAN_LEAD_MS` | Lead compensation (0 = disabled, tune after gains are set) |
+| `LIDAR_ENABLED` | Set False to disable range gating entirely |
+| `LIDAR_MAX_RANGE_CM` | Suppress aim beyond this distance (default 300 cm) |
+| `LIDAR_MIN_RANGE_CM` | Suppress aim closer than this distance (default 20 cm) |
 
 ## Measured Latency (p50, active tracking)
 
@@ -143,6 +168,8 @@ All tuning constants are in `config.py`.
 | control | 1.4 ms |
 | **total** | **~17 ms** |
 
+LiDAR `.get()` adds ~0 ms to the hot path (lock + dict lookup only).
+
 ## Branches
 
 | Branch | Description |
@@ -152,7 +179,7 @@ All tuning constants are in `config.py`.
 
 ## Roadmap
 
-- [ ] TF-Luna range-gating (reject detections beyond set distance)
+- [x] TF-Luna range-gating (reject detections beyond set distance)
 - [ ] Laser-on-lock logic (fire only when aim error < deadzone)
 - [ ] Tune Kalman lead compensation with dynamic `sensor_age_ms` feedback
 - [ ] Performance characterization table (accuracy vs. distance)
